@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from accelerate import Accelerator
 from accelerate.utils import set_seed
 import argparse
@@ -89,8 +89,10 @@ def main():
     train_dataset = TimeBrainsDataset(args.data_dir, is_train=True, patient_ids=train_patients)
     val_dataset = TimeBrainsDataset(args.data_dir, is_train=False, patient_ids=val_patients)
     
-    train_loader = DataLoader(train_dataset, batch_size=4, shuffle=True, num_workers=4)
-    val_loader = DataLoader(val_dataset, batch_size=4, shuffle=False, num_workers=2)
+    train_loader = DataLoader(train_dataset, batch_size=4, shuffle=True, num_workers=4,
+                              pin_memory=True, persistent_workers=True, prefetch_factor=2)
+    val_loader = DataLoader(val_dataset, batch_size=4, shuffle=False, num_workers=2,
+                            pin_memory=True, persistent_workers=True)
     
     accelerator.print(f"Train pairs: {len(train_dataset)}, Val pairs: {len(val_dataset)}")
 
@@ -103,8 +105,15 @@ def main():
     opt_g = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-5)
     opt_d = torch.optim.AdamW(discriminator.parameters(), lr=1e-4, weight_decay=1e-5)
     
-    scheduler_g = CosineAnnealingLR(opt_g, T_max=args.epochs, eta_min=1e-6)
-    scheduler_d = CosineAnnealingLR(opt_d, T_max=args.epochs, eta_min=1e-6)
+    warmup_epochs = 5
+    scheduler_g = SequentialLR(opt_g, schedulers=[
+        LinearLR(opt_g, start_factor=0.01, end_factor=1.0, total_iters=warmup_epochs),
+        CosineAnnealingLR(opt_g, T_max=max(1, args.epochs - warmup_epochs), eta_min=1e-6),
+    ], milestones=[warmup_epochs])
+    scheduler_d = SequentialLR(opt_d, schedulers=[
+        LinearLR(opt_d, start_factor=0.01, end_factor=1.0, total_iters=warmup_epochs),
+        CosineAnnealingLR(opt_d, T_max=max(1, args.epochs - warmup_epochs), eta_min=1e-6),
+    ], milestones=[warmup_epochs])
     
     # Class weights: amplify rare classes (2=necrosis, 3=GD-enhanced are smallest)
     seg_class_weights = torch.tensor([0.5, 1.0, 2.0, 4.0])  # BG, TC, WT, GD
@@ -115,22 +124,32 @@ def main():
     model, discriminator, opt_g, opt_d, train_loader, val_loader = accelerator.prepare(
         model, discriminator, opt_g, opt_d, train_loader, val_loader
     )
-    
+
     # Schedulers should NOT be prepared by accelerate
     start_epoch = 0
+    best_val_loss = float('inf')
+
+    # EMA: exponential moving average of generator weights (beta=0.999)
+    ema_decay = 0.999
+    if accelerator.is_main_process:
+        ema_weights = {k: v.detach().clone().cpu()
+                       for k, v in accelerator.unwrap_model(model).state_dict().items()}
 
     # --- Resume from checkpoint ---
     if args.resume and os.path.isdir(args.resume):
         ckpt_path = os.path.join(args.resume, "training_state.pth")
         if os.path.exists(ckpt_path):
             ckpt = torch.load(ckpt_path, map_location=accelerator.device)
-            accelerator.unwrap_model(model).load_state_dict(ckpt['model'])
+            accelerator.unwrap_model(model).load_state_dict(ckpt['model_state_dict'])
             accelerator.unwrap_model(discriminator).load_state_dict(ckpt['discriminator'])
-            opt_g.load_state_dict(ckpt['opt_g'])
-            opt_d.load_state_dict(ckpt['opt_d'])
-            scheduler_g.load_state_dict(ckpt['scheduler_g'])
-            scheduler_d.load_state_dict(ckpt['scheduler_d'])
+            opt_g.load_state_dict(ckpt['optimizer_g_state_dict'])
+            opt_d.load_state_dict(ckpt['optimizer_d_state_dict'])
+            scheduler_g.load_state_dict(ckpt['scheduler_g_state_dict'])
+            scheduler_d.load_state_dict(ckpt['scheduler_d_state_dict'])
             start_epoch = ckpt['epoch']
+            best_val_loss = ckpt.get('best_val_loss', float('inf'))
+            if 'ema_weights' in ckpt and accelerator.is_main_process:
+                ema_weights = ckpt['ema_weights']
             accelerator.print(f"Resumed from epoch {start_epoch}")
 
     epochs = args.epochs
@@ -174,8 +193,8 @@ def main():
                 combined_logits = discriminator(combined)
                 real_logits, fake_logits = combined_logits.chunk(2, dim=0)
                 
-                d_loss = (criterion_bce(real_logits, torch.ones_like(real_logits)) +
-                          criterion_bce(fake_logits, torch.zeros_like(fake_logits))) / 2
+                d_loss = (F.relu(1.0 - real_logits).mean() +
+                          F.relu(1.0 + fake_logits).mean()) / 2
                 
                 accelerator.backward(d_loss)
                 accelerator.clip_grad_norm_(discriminator.parameters(), max_norm=1.0)
@@ -195,7 +214,7 @@ def main():
                 seg_pred_onehot_g = F.one_hot(torch.argmax(F.softmax(seg_next_pred, dim=1), dim=1), num_classes=4).permute(0, 4, 1, 2, 3).float()
                 fake_input_g = torch.cat([img_next_pred, seg_pred_onehot_g], dim=1)
                 fake_logits_for_g = discriminator(fake_input_g)
-                g_adv_loss = criterion_bce(fake_logits_for_g, torch.ones_like(fake_logits_for_g))
+                g_adv_loss = -fake_logits_for_g.mean()
                 g_adv_weight = 0.1
             else:
                 g_adv_loss = torch.tensor(0.0, device=img_t.device)
@@ -228,7 +247,12 @@ def main():
             accelerator.backward(g_loss)
             accelerator.clip_grad_norm_(model.parameters(), max_norm=1.0)
             opt_g.step()
-            
+
+            # EMA update
+            if accelerator.is_main_process:
+                for k, v in accelerator.unwrap_model(model).state_dict().items():
+                    ema_weights[k].mul_(ema_decay).add_(v.detach().cpu(), alpha=1.0 - ema_decay)
+
             discriminator.train()
             for p in discriminator.parameters():
                 p.requires_grad = True
@@ -282,9 +306,26 @@ def main():
                     val_seg_loss += v_seg.item()
                     
             n_val_steps = max(1, len(val_loader))
+            avg_val_img = val_img_loss / n_val_steps
+            avg_val_seg = val_seg_loss / n_val_steps
+            val_total = avg_val_img + avg_val_seg
             accelerator.print(
-                f"  Val | ROI MSE: {val_img_loss/n_val_steps:.4f} | "
-                f"Seg(Focal+Dice): {val_seg_loss/n_val_steps:.4f}")
+                f"  Val | ROI MSE: {avg_val_img:.4f} | "
+                f"Seg(Focal+Dice): {avg_val_seg:.4f}")
+
+            # Save best checkpoint
+            accelerator.wait_for_everyone()
+            if accelerator.is_main_process and val_total < best_val_loss:
+                best_val_loss = val_total
+                ckpt_dir = "checkpoints"
+                os.makedirs(ckpt_dir, exist_ok=True)
+                unwrapped_best = accelerator.unwrap_model(model)
+                torch.save(unwrapped_best.state_dict(),
+                           os.path.join(ckpt_dir, "timebrainsgen_v15_best.pth"))
+                # Also save EMA weights as best_ema
+                torch.save(ema_weights,
+                           os.path.join(ckpt_dir, "timebrainsgen_v15_best_ema.pth"))
+                accelerator.print(f"  Best model saved (val_loss={val_total:.4f})")
         # Step schedulers AFTER all optimizer.step() calls in this epoch
         scheduler_g.step()
         scheduler_d.step()
@@ -301,11 +342,16 @@ def main():
             # Save model weights (for evaluate.py)
             torch.save(unwrapped_model.state_dict(),
                        os.path.join(ckpt_dir, f"timebrainsgen_v15_epoch_{epoch+1}.pth"))
-            
+            # Save EMA weights
+            torch.save(ema_weights,
+                       os.path.join(ckpt_dir, f"timebrainsgen_v15_ema_epoch_{epoch+1}.pth"))
+
             # Save full training state (for resume)
             torch.save({
                 'epoch': epoch + 1,
                 'model_state_dict': unwrapped_model.state_dict(),
+                'ema_weights': ema_weights,
+                'best_val_loss': best_val_loss,
                 'optimizer_g_state_dict': opt_g.state_dict(),
                 'optimizer_d_state_dict': opt_d.state_dict(),
                 'scheduler_g_state_dict': scheduler_g.state_dict(),

@@ -177,8 +177,16 @@ class TimeBrainsModel(nn.Module):
         self.down4 = nn.MaxPool3d(2)                     # → /16 ≈ 11×13×11
 
         # --- Transformer Bottleneck ---
-        max_tokens = 2048  # 11*13*11 = 1573 in our case
-        self.pos_embed = nn.Parameter(torch.randn(1, max_tokens, trans_dim) * 0.02)
+        # 3D decomposed positional encoding: pos[d,h,w] = emb_d[d] + emb_h[h] + emb_w[w]
+        # Better than 1D sequence pos_embed: captures spatial structure in each axis.
+        max_spatial = 20  # safe upper bound for /16 resolution per axis
+        dim_d = trans_dim // 3 + trans_dim % 3  # absorb remainder into D axis
+        dim_h = trans_dim // 3
+        dim_w = trans_dim // 3
+        self.pos_embed_d = nn.Parameter(torch.randn(1, max_spatial, dim_d) * 0.02)
+        self.pos_embed_h = nn.Parameter(torch.randn(1, max_spatial, dim_h) * 0.02)
+        self.pos_embed_w = nn.Parameter(torch.randn(1, max_spatial, dim_w) * 0.02)
+        self._pos_dim = (dim_d, dim_h, dim_w)
         self.transformer_blocks = nn.ModuleList([
             AdaLNTransformerBlock(trans_dim, num_heads, cond_dim)
             for _ in range(num_transformer_blocks)
@@ -222,8 +230,14 @@ class TimeBrainsModel(nn.Module):
         # 3. Transformer bottleneck
         B, C, D, H, W = z.shape
         tokens = z.flatten(2).transpose(1, 2)  # (B, N, C)
-        N = tokens.shape[1]
-        tokens = tokens + self.pos_embed[:, :N, :]
+        # 3D decomposed positional encoding
+        pd = self.pos_embed_d[:, :D, :]  # (1, D, dim_d)
+        ph = self.pos_embed_h[:, :H, :]  # (1, H, dim_h)
+        pw = self.pos_embed_w[:, :W, :]  # (1, W, dim_w)
+        pos_3d = (pd.unsqueeze(2).unsqueeze(2).expand(1, D, H, W, -1) +
+                  ph.unsqueeze(1).unsqueeze(3).expand(1, D, H, W, -1) +
+                  pw.unsqueeze(1).unsqueeze(2).expand(1, D, H, W, -1))
+        tokens = tokens + pos_3d.reshape(1, D * H * W, -1)
 
         for block in self.transformer_blocks:
             tokens = block(tokens, cond)
