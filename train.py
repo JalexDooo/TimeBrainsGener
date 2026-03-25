@@ -242,7 +242,7 @@ def main():
             recon_seg_dice  = criterion_dice(seg_next_pred, seg_next_gt)
             recon_seg_loss  = recon_seg_focal + recon_seg_dice
             
-            g_loss = recon_img_loss + 1.0 * recon_seg_loss + g_adv_weight * g_adv_loss
+            g_loss = 0.2 * recon_img_loss + 1.0 * recon_seg_loss + g_adv_weight * g_adv_loss
             
             accelerator.backward(g_loss)
             accelerator.clip_grad_norm_(model.parameters(), max_norm=1.0)
